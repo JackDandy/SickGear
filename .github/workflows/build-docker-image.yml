@@ -1,0 +1,132 @@
+name: Docker build/push
+
+on:
+  push:
+    branches: [ main, dev ]
+
+jobs:
+  Builder:
+    runs-on: ubuntu-latest
+
+    env:
+      PLATFORMS: linux/amd64, linux/arm64, linux/arm/v7, linux/386, linux/ppc64le, linux/s390x
+      IMAGE_NAME: ${{ github.repository }}
+      GHCR: ghcr.io
+
+    steps:
+    - name: Qemu set up
+      id: qemu
+      uses: docker/setup-qemu-action@v2
+
+    - name: Buildx set up
+      uses: docker/setup-buildx-action@v2
+
+    - name: GHCR login
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.GHCR }}
+        username: ${{ secrets.GHCR_OWNER }}
+        password: ${{ secrets.GHCR_TOKEN }}
+
+    - name: Dockerhub login
+      # as the source for image copy, must login here last
+      uses: docker/login-action@v2
+      with:
+        username: sickgear
+        password: ${{ secrets.DOCKER_TOKEN }}
+
+    - name: Main ENV set up
+      if: contains(github.ref, 'main')
+      run: |
+        echo "NAME_ENV=Main" >> $GITHUB_ENV
+        echo "DOCKER_TAG=sickgear/sickgear:latest" >> $GITHUB_ENV
+
+    - name: Dev ENV set up
+      if: contains(github.ref, 'dev')
+      run: |
+        echo "NAME_ENV=Dev" >> $GITHUB_ENV
+        echo "DOCKER_TAG=sickgear/sickgear:develop" >> $GITHUB_ENV
+
+    - name: Main build image
+      if: contains(github.ref, 'main')
+      env:
+        DOCKER_CTX: ${{ secrets.DOCKER_MASTER }}
+      uses: docker/build-push-action@v3
+      with:
+        push: true
+        tags: ${{ env.DOCKER_TAG }}
+        context: ${{ env.DOCKER_CTX }}
+        platforms: ${{ env.PLATFORMS }}
+
+    - name: Dev build image
+      if: contains(github.ref, 'dev')
+      env:
+        DOCKER_CTX: ${{ secrets.DOCKER_DEVELOP }}
+      uses: docker/build-push-action@v3
+      with:
+        push: true
+        tags: ${{ env.DOCKER_TAG }}
+        context: ${{ env.DOCKER_CTX }}
+        platforms: ${{ env.PLATFORMS }}
+
+    - name: Extract GHCR metadata
+      # Extract main metadata (tags, labels)
+      # https://github.com/docker/metadata-action
+      id: meta_github
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ env.GHCR }}/${{ env.IMAGE_NAME }}
+
+    - name: Extract Dockerhub metadata
+      # Extract main metadata (tags, labels)
+      # https://github.com/docker/metadata-action
+      id: meta_dockerhub
+      uses: docker/metadata-action@v4
+      with:
+        images: docker.io/${{ env.IMAGE_NAME }}
+
+    - name: Log vars
+      run: |
+        echo "Tags for ${{ env.DOCKER_TAG }}"
+        echo ${{ fromJSON(steps.meta_github.outputs.json).tags[0] }}
+        echo ${{ fromJSON(steps.meta_dockerhub.outputs.json).tags[0] }}
+        echo "Qemu available platforms: ${{ steps.qemu.outputs.platforms }}"
+
+    - name: Main GHCR deployment
+      # copy image from dockerhub to ghcr
+      if: contains(github.ref, '!NOT! main')
+      uses: akhilerm/tag-push-action@v2.0.0
+      with:
+        src: docker.io/${{ env.DOCKER_TAG }}
+        dst: |
+          ${{ fromJSON(steps.meta_github.outputs.json).tags[0] }}
+          # ${{ env.GHCR }}/SickGear/SickGear.Docker:latest
+
+    - name: Dev GHCR deployment
+      # copy image from dockerhub to ghcr
+      if: contains(github.ref, '!NOT! dev')
+      uses: akhilerm/tag-push-action@v2.0.0
+      with:
+        src: docker.io/${{ env.DOCKER_TAG }}
+        dst: |
+          ${{ fromJSON(steps.meta_github.outputs.json).tags[0] }}
+          # ghcr.io/sickgear/sickgear:develop
+
+    - name: Discord notify
+      run: |
+        MSG=$(echo "${{ env.NAME_ENV }} docker build complete ${{ github.event.compare }}")
+        echo "${MSG}"
+        curl -X POST -H "Content-Type: application/json" \
+        --data '{
+          "username": "Github Actions", "avatar_url": "${{ secrets.DISCORD_AVATAR_GHA }}",
+          "embeds": [{"color": 16711680, "description": "'"${MSG}"'"}]
+          }' ${{ secrets.DISCORD_WEBHOOK }}
+
+# 2023.05.22 fails due to added to a blocklist
+#    - name: IRC notify
+#      uses: Gottox/irc-message-action@v2
+#      with:
+#        channel: ${{ secrets.IRC_CHANNEL }}
+#        nickname: ${{ secrets.IRC_NICK }}
+#        message: |-
+#          ${{ env.NAME_ENV }} commit ${{ github.event.compare }}

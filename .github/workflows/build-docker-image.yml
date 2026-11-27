@@ -1,0 +1,358 @@
+name: Docker build/push
+
+on:
+  push:
+    branches: [ main, dev ]
+  # run by hand to only copy the README to the Docker Hub overview, no image build,
+  # or with build true to build latest, as the SickGear release workflow does when a release is published
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'Build latest (else only update the Docker Hub description)'
+        type: boolean
+        default: false
+  # daily check for a new SickGear release, builds latest only when the image has an older one
+  schedule:
+    - cron: '17 5 * * *'
+
+env:
+  IMAGE: sickgear/sickgear
+  # UnRAR stage build cache, kept in a registry as it does not expire like the 7 day GitHub cache,
+  # a failed cache export does not fail the build
+  CACHE: sickgear/sickgear-buildcache
+  MAIN_TAG: latest
+  DEV_TAG: develop
+
+jobs:
+  # decide whether to build latest: always on a push, on the daily schedule only when a new release is out
+  main-check:
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'workflow_dispatch' && inputs.build)
+    name: Main release check
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      tag: ${{ steps.check.outputs.tag }}
+
+    steps:
+    - name: Compare latest release with the image
+      id: check
+      run: |
+        tag=$(curl -s -o /dev/null -w '%{redirect_url}' 'https://github.com/SickGear/SickGear/releases/latest' | sed 's#.*/tag/##')
+        if [ -z "$tag" ]; then echo 'no release tag found'; exit 1; fi
+        built=$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ env.MAIN_TAG }}" --format '{{json .Image}}' \
+          | jq -r '."linux/amd64".config.Labels."org.opencontainers.image.version" // ""' || true)
+        build=false
+        if [ 'schedule' != '${{ github.event_name }}' ] || [ "$tag" != "$built" ]; then build=true; fi
+        echo "latest release: $tag, in image: ${built:-unknown}, build: $build"
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "build=$build" >> "$GITHUB_OUTPUT"
+
+    - name: Keep the schedule enabled
+      # GitHub turns off scheduled workflows after 60 days without repository activity
+      if: github.event_name == 'schedule'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build-docker-image.yml/enable"
+
+  # one job per platform, all in parallel, each pushes its image by digest
+  main-build:
+    needs: main-check
+    if: needs.main-check.outputs.build == 'true'
+    name: Main ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, runner: ubuntu-24.04 }
+          - { platform: linux/386, runner: ubuntu-24.04 }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { platform: linux/arm/v7, runner: ubuntu-24.04-arm, qemu: arm }
+          - { platform: linux/arm/v6, runner: ubuntu-24.04-arm, qemu: arm }
+          - { platform: linux/ppc64le, runner: ubuntu-24.04, qemu: ppc64le }
+          - { platform: linux/s390x, runner: ubuntu-24.04, qemu: s390x }
+          - { platform: linux/riscv64, runner: ubuntu-24.04, qemu: riscv64 }
+
+    steps:
+    - name: Platform name for cache and artifact
+      run: |
+        p='${{ matrix.platform }}'
+        echo "PLATFORM_PAIR=${p//\//-}" >> "$GITHUB_ENV"
+
+    - name: Qemu set up
+      # arm/v7 and arm/v6 run natively where the arm runner CPU can run 32-bit code, else under qemu
+      if: matrix.qemu
+      uses: docker/setup-qemu-action@v4
+      with:
+        platforms: ${{ matrix.qemu }}
+
+    - name: Buildx set up
+      uses: docker/setup-buildx-action@v4
+
+    - name: Dockerhub login
+      uses: docker/login-action@v4
+      with:
+        username: sickgear
+        password: ${{ secrets.DOCKER_TOKEN }}
+
+    - name: UnRAR stage from cache
+      # only rebuilt when the UnRAR source or the base image changes
+      uses: docker/build-push-action@v7
+      with:
+        context: ${{ secrets.DOCKER_MASTER }}
+        target: unrar
+        platforms: ${{ matrix.platform }}
+        cache-from: type=registry,ref=${{ env.CACHE }}:main-unrar-${{ env.PLATFORM_PAIR }}
+        cache-to: type=registry,ref=${{ env.CACHE }}:main-unrar-${{ env.PLATFORM_PAIR }},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+
+    - name: Main build image
+      id: build
+      uses: docker/build-push-action@v7
+      with:
+        context: ${{ secrets.DOCKER_MASTER }}
+        platforms: ${{ matrix.platform }}
+        build-args: |
+          BUILD_ID=${{ github.run_id }}-${{ github.run_attempt }}
+          SG_TAG=${{ needs.main-check.outputs.tag }}
+        cache-from: type=registry,ref=${{ env.CACHE }}:main-unrar-${{ env.PLATFORM_PAIR }}
+        outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+    - name: Export digest
+      run: |
+        mkdir -p ${{ runner.temp }}/digests
+        digest='${{ steps.build.outputs.digest }}'
+        touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+    - name: Upload digest
+      uses: actions/upload-artifact@v7
+      with:
+        name: digests-${{ env.PLATFORM_PAIR }}
+        path: ${{ runner.temp }}/digests/*
+        if-no-files-found: error
+        retention-days: 1
+
+  # join the platform images into one tag, only when every platform built
+  main-merge:
+    name: Main merge
+    needs: main-build
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Download digests
+      uses: actions/download-artifact@v8
+      with:
+        path: ${{ runner.temp }}/digests
+        pattern: digests-*
+        merge-multiple: true
+
+    - name: Buildx set up
+      uses: docker/setup-buildx-action@v4
+
+    - name: Dockerhub login
+      uses: docker/login-action@v4
+      with:
+        username: sickgear
+        password: ${{ secrets.DOCKER_TOKEN }}
+
+    - name: Create manifest list and push
+      working-directory: ${{ runner.temp }}/digests
+      run: |
+        docker buildx imagetools create -t ${{ env.IMAGE }}:${{ env.MAIN_TAG }} \
+          $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+    - name: Inspect image
+      run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ env.MAIN_TAG }}
+
+    - name: Docker README checkout
+      if: env.MAIN_TAG == 'latest'
+      uses: actions/checkout@v7
+      with:
+        repository: SickGear/SickGear.Docker
+        ref: master
+        path: docker-readme
+
+    - name: Docker README for Docker Hub
+      if: env.MAIN_TAG == 'latest'
+      # Docker Hub drops align on div, p and table, keeps it only on table cells, and shows images as blocks that
+      # text-align cannot move, while GitHub draws a border round any table; so for Docker Hub only, centred text
+      # goes in one centred cell, and the logo and the marked badges sit in one table row between two equal
+      # transparent spacers, which share the spare width evenly and so centre them
+      run: |
+        python3 - docker-readme/README.md <<'EOF'
+        import re, sys
+        path = sys.argv[1]
+        text = open(path, encoding='utf-8').read()
+        spacer = '<img alt="" width="%s" src="https://raw.githubusercontent.com/SickGear/SickGear.Docker/master/images/spacer.png">'
+        def cell(html):
+            return '<table><tr><td align="center">\n%s\n</td></tr></table>' % html.strip()
+        def centred_row(items, side):
+            return ('<table><tr><td>%s</td>' % (spacer % side) + ''.join('<td>%s</td>' % x for x in items)
+                    + '<td>%s</td></tr></table>' % (spacer % side))
+        def badges(match):
+            return '<!-- badges -->' + '|'.join(re.findall(r'<a [^>]+><img [^>]+></a>', match.group(1))) + '<!-- /badges -->'
+        def block(match):
+            inner = match.group(1)
+            if inner.lstrip().startswith('<table'):
+                return re.sub(r'<table align="center">', '<table>', inner).replace('align="left"', 'align="center"')
+            parts = []
+            logo = re.search(r'<img alt="SickGear Logo"[^>]*>', inner)
+            if logo:
+                parts.append(centred_row([logo.group(0)], 300))
+                inner = inner.replace(logo.group(0), '')
+            found = re.search(r'<!-- badges -->(.*?)<!-- /badges -->', inner)
+            if found:
+                parts.append(centred_row(found.group(1).split('|'), 200))
+                inner = inner.replace(found.group(0), '')
+            inner = re.sub(r'^\s*(<br>\s*)+', '', inner.strip())
+            if inner:
+                parts.append(cell(inner))
+            return '\n'.join(parts)
+        text, n_badges = re.subn(r'<!-- hub-badges-start -->(.*?)<!-- hub-badges-end -->', badges, text, flags=re.S)
+        text, n_div = re.subn(r'<div align="center">\n(.*?)\n</div>', block, text, flags=re.S)
+        text, n_p = re.subn(r'<p align="center">(.*?)</p>', lambda m: cell(m.group(1)), text, flags=re.S)
+        print('Docker Hub copy: %s badge row, %s centred blocks, %s centred lines' % (n_badges, n_div, n_p))
+        open(path, 'w', encoding='utf-8').write(text)
+        EOF
+
+    - name: Dockerhub description update
+      # keep the Docker Hub overview the same as the master README, a failure here does not fail the build
+      if: env.MAIN_TAG == 'latest'
+      continue-on-error: true
+      uses: peter-evans/dockerhub-description@v5
+      with:
+        username: sickgear
+        password: ${{ secrets.DOCKER_TOKEN }}
+        repository: ${{ env.IMAGE }}
+        readme-filepath: docker-readme/README.md
+
+    - name: Discord notify
+      run: |
+        MSG=$(echo "Main docker build complete ${{ github.event.compare }}")
+        echo "${MSG}"
+        curl -X POST -H "Content-Type: application/json" \
+        --data '{
+          "username": "Github Actions", "avatar_url": "${{ secrets.DISCORD_AVATAR_GHA }}",
+          "embeds": [{"color": 16711680, "description": "'"${MSG}"'"}]
+          }' ${{ secrets.DISCORD_WEBHOOK }}
+
+  hub-description:
+    if: github.event_name == 'workflow_dispatch' && !inputs.build
+    name: Dockerhub description
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Docker README checkout
+      uses: actions/checkout@v7
+      with:
+        repository: SickGear/SickGear.Docker
+        ref: master
+        path: docker-readme
+
+    - name: Docker README for Docker Hub
+      if: env.MAIN_TAG == 'latest'
+      # Docker Hub drops align on div, p and table, keeps it only on table cells, and shows images as blocks that
+      # text-align cannot move, while GitHub draws a border round any table; so for Docker Hub only, centred text
+      # goes in one centred cell, and the logo and the marked badges sit in one table row between two equal
+      # transparent spacers, which share the spare width evenly and so centre them
+      run: |
+        python3 - docker-readme/README.md <<'EOF'
+        import re, sys
+        path = sys.argv[1]
+        text = open(path, encoding='utf-8').read()
+        spacer = '<img alt="" width="%s" src="https://raw.githubusercontent.com/SickGear/SickGear.Docker/master/images/spacer.png">'
+        def cell(html):
+            return '<table><tr><td align="center">\n%s\n</td></tr></table>' % html.strip()
+        def centred_row(items, side):
+            return ('<table><tr><td>%s</td>' % (spacer % side) + ''.join('<td>%s</td>' % x for x in items)
+                    + '<td>%s</td></tr></table>' % (spacer % side))
+        def badges(match):
+            return '<!-- badges -->' + '|'.join(re.findall(r'<a [^>]+><img [^>]+></a>', match.group(1))) + '<!-- /badges -->'
+        def block(match):
+            inner = match.group(1)
+            if inner.lstrip().startswith('<table'):
+                return re.sub(r'<table align="center">', '<table>', inner).replace('align="left"', 'align="center"')
+            parts = []
+            logo = re.search(r'<img alt="SickGear Logo"[^>]*>', inner)
+            if logo:
+                parts.append(centred_row([logo.group(0)], 300))
+                inner = inner.replace(logo.group(0), '')
+            found = re.search(r'<!-- badges -->(.*?)<!-- /badges -->', inner)
+            if found:
+                parts.append(centred_row(found.group(1).split('|'), 200))
+                inner = inner.replace(found.group(0), '')
+            inner = re.sub(r'^\s*(<br>\s*)+', '', inner.strip())
+            if inner:
+                parts.append(cell(inner))
+            return '\n'.join(parts)
+        text, n_badges = re.subn(r'<!-- hub-badges-start -->(.*?)<!-- hub-badges-end -->', badges, text, flags=re.S)
+        text, n_div = re.subn(r'<div align="center">\n(.*?)\n</div>', block, text, flags=re.S)
+        text, n_p = re.subn(r'<p align="center">(.*?)</p>', lambda m: cell(m.group(1)), text, flags=re.S)
+        print('Docker Hub copy: %s badge row, %s centred blocks, %s centred lines' % (n_badges, n_div, n_p))
+        open(path, 'w', encoding='utf-8').write(text)
+        EOF
+
+    - name: Dockerhub description update
+      uses: peter-evans/dockerhub-description@v5
+      with:
+        username: sickgear
+        password: ${{ secrets.DOCKER_TOKEN }}
+        repository: ${{ env.IMAGE }}
+        readme-filepath: docker-readme/README.md
+
+  dev-build:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    name: Dev linux/amd64
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Buildx set up
+      uses: docker/setup-buildx-action@v4
+
+    - name: Dockerhub login
+      uses: docker/login-action@v4
+      with:
+        username: sickgear
+        password: ${{ secrets.DOCKER_TOKEN }}
+
+    - name: UnRAR stage from cache
+      uses: docker/build-push-action@v7
+      with:
+        context: ${{ secrets.DOCKER_DEVELOP }}
+        target: unrar
+        platforms: linux/amd64
+        cache-from: type=registry,ref=${{ env.CACHE }}:dev-unrar-linux-amd64
+        cache-to: type=registry,ref=${{ env.CACHE }}:dev-unrar-linux-amd64,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+
+    - name: Dev build image
+      uses: docker/build-push-action@v7
+      with:
+        context: ${{ secrets.DOCKER_DEVELOP }}
+        platforms: linux/amd64
+        build-args: BUILD_ID=${{ github.run_id }}-${{ github.run_attempt }}
+        cache-from: type=registry,ref=${{ env.CACHE }}:dev-unrar-linux-amd64
+        push: true
+        tags: ${{ env.IMAGE }}:${{ env.DEV_TAG }}
+
+    - name: Discord notify
+      run: |
+        MSG=$(echo "Dev docker build complete ${{ github.event.compare }}")
+        echo "${MSG}"
+        curl -X POST -H "Content-Type: application/json" \
+        --data '{
+          "username": "Github Actions", "avatar_url": "${{ secrets.DISCORD_AVATAR_GHA }}",
+          "embeds": [{"color": 16711680, "description": "'"${MSG}"'"}]
+          }' ${{ secrets.DISCORD_WEBHOOK }}
+
+# 2023.05.22 fails due to added to a blocklist
+#    - name: IRC notify
+#      uses: Gottox/irc-message-action@v2
+#      with:
+#        channel: ${{ secrets.IRC_CHANNEL }}
+#        nickname: ${{ secrets.IRC_NICK }}
+#        message: |-
+#          ${{ env.NAME_ENV }} commit ${{ github.event.compare }}
